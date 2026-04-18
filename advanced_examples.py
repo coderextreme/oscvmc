@@ -1,0 +1,1304 @@
+"""
+Advanced Usage Examples for MediaPipe Joint Rotation Calculator
+================================================================
+This script demonstrates advanced features and custom usage patterns.
+"""
+
+import cv2
+import numpy as np
+from mediapipe_joint_rotations_ENHANCED import MediaPipeJointRotations, JointRotation
+import json
+import time
+from pythonosc import udp_client
+from pythonosc.osc_message_builder import OscMessageBuilder
+import mediapipe as mp
+from typing import Tuple, Optional, Dict
+
+class AdvancedJointAnalyzer(MediaPipeJointRotations):
+    """Extended version with advanced analysis features"""
+
+    def __init__(self):
+        super().__init__()
+        self.rotation_history = []
+        self.max_history = 30  # Store last 30 frames
+
+    def analyze_angular_velocity(self, current_rotations: dict,
+                                 previous_rotations: dict,
+                                 dt: float = 0.033) -> dict:
+        """
+        Calculate angular velocity for each joint
+
+        Args:
+            current_rotations: Current frame rotations
+            previous_rotations: Previous frame rotations
+            dt: Time difference between frames (seconds)
+
+        Returns:
+            Dictionary of angular velocities (rad/s)
+        """
+        angular_velocities = {}
+
+        for joint_idx in current_rotations:
+            if joint_idx in previous_rotations:
+                current_rv = current_rotations[joint_idx].rotation_vector
+                previous_rv = previous_rotations[joint_idx].rotation_vector
+
+                # Calculate angular difference
+                delta_rv = current_rv - previous_rv
+
+                # Angular velocity (rad/s)
+                angular_vel = np.linalg.norm(delta_rv) / dt
+                angular_velocities[joint_idx] = angular_vel
+
+        return angular_velocities
+
+    def detect_pose_changes(self, rotations: dict, threshold: float = 10.0) -> list:
+        """
+        Detect significant pose changes based on rotation thresholds
+
+        Args:
+            rotations: Current joint rotations
+            threshold: Minimum angle change in degrees to count as significant
+
+        Returns:
+            List of joints with significant changes
+        """
+        if len(self.rotation_history) < 2:
+            return []
+
+        changed_joints = []
+        previous_frame = self.rotation_history[-2]
+
+        for category in rotations:
+            if category not in previous_frame:
+                continue
+
+            current_rots = rotations[category]
+            previous_rots = previous_frame[category]
+
+            for joint_idx in current_rots:
+                if joint_idx in previous_rots:
+                    current_euler = current_rots[joint_idx].euler_angles
+                    previous_euler = previous_rots[joint_idx].euler_angles
+
+                    # Calculate total angle change
+                    angle_diff = np.linalg.norm(current_euler - previous_euler)
+
+                    if angle_diff > threshold:
+                        changed_joints.append({
+                            'category': category,
+                            'joint': joint_idx,
+                            'name': current_rots[joint_idx].joint_name,
+                            'angle_change': angle_diff
+                        })
+
+        return changed_joints
+
+    def calculate_joint_angle(self, parent_pos: np.ndarray,
+                             joint_pos: np.ndarray,
+                             child_pos: np.ndarray) -> float:
+        """
+        Calculate the angle at a joint (in degrees)
+
+        Args:
+            parent_pos: Position of parent joint
+            joint_pos: Position of current joint
+            child_pos: Position of child joint
+
+        Returns:
+            Joint angle in degrees
+        """
+        # Vectors from joint to parent and child
+        v1 = parent_pos - joint_pos
+        v2 = child_pos - joint_pos
+
+        # Normalize
+        v1_norm = self.normalize_vector(v1)
+        v2_norm = self.normalize_vector(v2)
+
+        # Calculate angle
+        cos_angle = np.dot(v1_norm, v2_norm)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        angle = np.arccos(cos_angle)
+
+        return np.degrees(angle)
+
+    def quaternion_from_rotation_matrix(self, R: np.ndarray) -> np.ndarray:
+        """
+        Convert rotation matrix to quaternion (w, x, y, z)
+
+        Args:
+            R: 3x3 rotation matrix
+
+        Returns:
+            Quaternion as [x, y, z, w] (VMC convention)
+        """
+        trace = np.trace(R)
+
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2, 1] - R[1, 2]) * s
+            y = (R[0, 2] - R[2, 0]) * s
+            z = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+
+        # Return in VMC format: x, y, z, w
+        return np.array([x, y, z, w])
+
+    def smooth_rotations(self, rotations: dict, alpha: float = 0.3) -> dict:
+        """
+        Apply exponential smoothing to rotation data
+
+        Args:
+            rotations: Current frame rotations
+            alpha: Smoothing factor (0 = no change, 1 = no smoothing)
+
+        Returns:
+            Smoothed rotations
+        """
+        if len(self.rotation_history) == 0:
+            return rotations
+
+        smoothed = {}
+        previous = self.rotation_history[-1]
+
+        for category in rotations:
+            smoothed[category] = {}
+
+            if category not in previous:
+                smoothed[category] = rotations[category]
+                continue
+
+            for joint_idx, rotation in rotations[category].items():
+                if joint_idx in previous[category]:
+                    prev_rot = previous[category][joint_idx]
+
+                    # Smooth rotation vector
+                    smoothed_rv = (alpha * rotation.rotation_vector +
+                                  (1 - alpha) * prev_rot.rotation_vector)
+
+                    # Convert back to rotation matrix and euler
+                    smoothed_rm, _ = cv2.Rodrigues(smoothed_rv)
+                    quaternion = self.quaternion_from_rotation_matrix(smoothed_rm)
+                    smoothed_euler = self.rodrigues_to_euler(smoothed_rv)
+
+                    # Create smoothed rotation object
+                    smoothed_rotation = JointRotation(
+                        joint_name=rotation.joint_name,
+                        rotation_vector=smoothed_rv,
+                        rotation_matrix=smoothed_rm,
+                        euler_angles=smoothed_euler,
+                        parent_joint=rotation.parent_joint,
+                        quaternion=quaternion
+                    )
+
+                    smoothed[category][joint_idx] = smoothed_rotation
+                else:
+                    smoothed[category][joint_idx] = rotation
+
+        return smoothed
+
+    def export_to_json(self, rotations: dict, filename: str):
+        """
+        Export rotation data to JSON format
+
+        Args:
+            rotations: Rotation data to export
+            filename: Output JSON filename
+        """
+        export_data = {}
+
+        for category, joints in rotations.items():
+            export_data[category] = {}
+
+            for joint_idx, rotation in joints.items():
+                export_data[category][str(joint_idx)] = {
+                    'joint_name': rotation.joint_name,
+                    'parent_joint': rotation.parent_joint,
+                    'rotation_vector': rotation.rotation_vector.tolist(),
+                    'rotation_matrix': rotation.rotation_matrix.tolist(),
+                    'euler_angles': {
+                        'roll': float(rotation.euler_angles[0]),
+                        'pitch': float(rotation.euler_angles[1]),
+                        'yaw': float(rotation.euler_angles[2])
+                    }
+                }
+
+        with open(filename, 'w') as f:
+            json.dump(export_data, f, indent=2)
+
+    def visualize_rotation_magnitude(self, image: np.ndarray,
+                                     rotations: dict,
+                                     landmarks_2d: np.ndarray):
+        """
+        Visualize rotation magnitude using color-coded circles
+
+        Args:
+            image: Image to draw on
+            rotations: Joint rotations
+            landmarks_2d: 2D landmark positions (normalized)
+        """
+        h, w = image.shape[:2]
+
+        for joint_idx, rotation in rotations.items():
+            if joint_idx < len(landmarks_2d):
+                # Get 2D position
+                x = int(landmarks_2d[joint_idx][0] * w)
+                y = int(landmarks_2d[joint_idx][1] * h)
+
+                # Calculate rotation magnitude
+                angle = np.linalg.norm(rotation.rotation_vector)
+
+                # Map to color (0 = green, π = red)
+                color_val = int(255 * min(angle / np.pi, 1.0))
+                color = (0, 255 - color_val, color_val)
+
+                # Draw circle with size based on rotation
+                radius = int(5 + angle * 10)
+                cv2.circle(image, (x, y), radius, color, -1)
+                cv2.circle(image, (x, y), radius, (255, 255, 255), 1)
+
+
+class OSCVMCClient:
+    """
+    Open Sound Control / Virtual Motion Capture Protocol Client
+    Sends joint positions and rotations to VMC-compatible applications
+    """
+
+    # VMC Protocol bone mapping for MediaPipe landmarks using HAnim Joint Names
+    VMC_BONE_MAPPING = {
+        # Pose landmarks to HAnim bones
+        'pose': {
+            0: 'skullbase',            # was Head
+            11: 'l_shoulder',          # was LeftShoulder
+            12: 'r_shoulder',          # was RightShoulder
+            13: 'l_elbow',             # was LeftUpperArm
+            14: 'r_elbow',             # was RightUpperArm
+            15: 'l_wrist',             # was LeftLowerArm
+            16: 'r_wrist',             # was RightLowerArm
+            23: 'l_hip',               # was LeftUpperLeg
+            24: 'r_hip',               # was RightUpperLeg
+            25: 'l_knee',              # was LeftLowerLeg
+            26: 'r_knee',              # was RightLowerLeg
+            27: 'l_talocrural',        # was LeftFoot
+            28: 'r_talocrural',        # was RightFoot
+        },
+        # Hand landmarks to HAnim bones
+        'left_hand': {
+            0: 'l_radiocarpal',
+            1: 'l_carpometacarpal_1',
+            2: 'l_metacarpophalangeal_1',
+            3: 'l_carpal_interphalangeal_1',
+            5: 'l_metacarpophalangeal_2',
+            6: 'l_carpal_proximal_interphalangeal_2',
+            7: 'l_carpal_distal_interphalangeal_2',
+            9: 'l_metacarpophalangeal_3',
+            10: 'l_carpal_proximal_interphalangeal_3',
+            11: 'l_carpal_distal_interphalangeal_3',
+            13: 'l_metacarpophalangeal_4',
+            14: 'l_carpal_proximal_interphalangeal_4',
+            15: 'l_carpal_distal_interphalangeal_4',
+            17: 'l_metacarpophalangeal_5',
+            18: 'l_carpal_proximal_interphalangeal_5',
+            19: 'l_carpal_distal_interphalangeal_5',
+        },
+        'right_hand': {
+            0: 'r_radiocarpal',
+            1: 'r_carpometacarpal_1',
+            2: 'r_metacarpophalangeal_1',
+            3: 'r_carpal_interphalangeal_1',
+            5: 'r_metacarpophalangeal_2',
+            6: 'r_carpal_proximal_interphalangeal_2',
+            7: 'r_carpal_distal_interphalangeal_2',
+            9: 'r_metacarpophalangeal_3',
+            10: 'r_carpal_proximal_interphalangeal_3',
+            11: 'r_carpal_distal_interphalangeal_3',
+            13: 'r_metacarpophalangeal_4',
+            14: 'r_carpal_proximal_interphalangeal_4',
+            15: 'r_carpal_distal_interphalangeal_4',
+            17: 'r_metacarpophalangeal_5',
+            18: 'r_carpal_proximal_interphalangeal_5',
+            19: 'r_carpal_distal_interphalangeal_5',
+        }
+    }
+
+    def __init__(self, ip: str = "127.0.0.1", port: int = 39539):
+        """
+        Initialize OSC/VMC client
+
+        Args:
+            ip: Target IP address (default: localhost)
+            port: Target port (default: 39539 - VMC protocol standard port)
+        """
+        self.ip = ip
+        self.port = port
+        self.client = udp_client.SimpleUDPClient(ip, port)
+        self.frame_count = 0
+        self.start_time = time.time()
+
+        print(f"OSC/VMC Client initialized: {ip}:{port}")
+        print("VMC Protocol Address Patterns:")
+        print("  /VMC/Ext/Bone/Pos - Bone position and rotation")
+        print("  /VMC/Ext/Root/Pos - Root position and rotation")
+        print("  /VMC/Ext/OK - Frame available signal")
+        print("  /VMC/Ext/T - Time signal")
+
+    def quaternion_from_rotation_matrix(self, R: np.ndarray) -> np.ndarray:
+        """
+        Convert rotation matrix to quaternion (w, x, y, z)
+
+        Args:
+            R: 3x3 rotation matrix
+
+        Returns:
+            Quaternion as [x, y, z, w] (VMC convention)
+        """
+        trace = np.trace(R)
+
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2, 1] - R[1, 2]) * s
+            y = (R[0, 2] - R[2, 0]) * s
+            z = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+
+        # Return in VMC format: x, y, z, w
+        return np.array([x, y, z, w])
+
+    def send_bone_transform(self, bone_name: str, position: np.ndarray,
+                           rotation_matrix: np.ndarray):
+        """
+        Send bone position and rotation via VMC protocol
+
+        Args:
+            bone_name: Name of the bone (VMC bone naming)
+            position: 3D position [x, y, z]
+            rotation_matrix: 3x3 rotation matrix
+        """
+        # Convert rotation matrix to quaternion
+        quat = self.quaternion_from_rotation_matrix(rotation_matrix)
+
+        # VMC protocol: /VMC/Ext/Bone/Pos
+        # Format: bone_name (string), px, py, pz, qx, qy, qz, qw (floats)
+        address = "/VMC/Ext/Bone/Pos"
+
+        # Send OSC message
+        self.client.send_message(address, [
+            bone_name,
+            float(position[0]),
+            -float(position[1]),
+            float(position[2]),
+            float(quat[0]),  # qx
+            -float(quat[1]),  # qy
+            -float(quat[2]),  # qz
+            float(quat[3])   # qw
+        ])
+
+    def send_root_transform(self, position: np.ndarray, rotation_matrix: np.ndarray):
+        """
+        Send root position and rotation via VMC protocol
+
+        Args:
+            position: 3D position [x, y, z]
+            rotation_matrix: 3x3 rotation matrix
+        """
+        quat = self.quaternion_from_rotation_matrix(rotation_matrix)
+
+        # VMC protocol: /VMC/Ext/Root/Pos
+        address = "/VMC/Ext/Root/Pos"
+
+        self.client.send_message(address, [
+            "root",
+            float(position[0]),
+            -float(position[1]),
+            float(position[2]),
+            float(quat[0]),
+            -float(quat[1]),
+            -float(quat[2]),
+            float(quat[3]),
+            0.0, 0.0, 0.0, 0.0  # Scale (not used, set to 0)
+        ])
+
+    def send_time(self):
+        """Send time signal (frame timing)"""
+        current_time = time.time() - self.start_time
+        self.client.send_message("/VMC/Ext/T", [float(current_time)])
+
+    def send_frame_available(self):
+        """Send frame available signal"""
+        self.client.send_message("/VMC/Ext/OK", [1])
+        self.frame_count += 1
+
+    def send_all_bones(self, landmarks_3d: dict, rotations: dict):
+        """
+        Send all bone transforms for the current frame
+
+        Args:
+            landmarks_3d: Dictionary of landmark positions by category
+            rotations: Dictionary of joint rotations by category
+        """
+        # Send time signal
+        self.send_time()
+
+        # Process pose landmarks
+        if 'pose' in landmarks_3d and 'pose' in rotations:
+            pose_landmarks = landmarks_3d['pose']
+            pose_rotations = rotations['pose']
+
+            for landmark_idx, bone_name in self.VMC_BONE_MAPPING['pose'].items():
+                if landmark_idx < len(pose_landmarks):
+                    position = pose_landmarks[landmark_idx]
+
+                    # Get rotation matrix (use identity if not available)
+                    if landmark_idx in pose_rotations:
+                        rotation_matrix = pose_rotations[landmark_idx].rotation_matrix
+                    else:
+                        rotation_matrix = np.eye(3)
+
+                    self.send_bone_transform(bone_name, position, rotation_matrix)
+
+            # Send root transform (hip center)
+            if len(pose_landmarks) > 24:
+                hip_center = (pose_landmarks[23] + pose_landmarks[24]) / 2
+                self.send_root_transform(hip_center, np.eye(3))
+
+        # Process left hand landmarks
+        if 'left_hand' in landmarks_3d and 'left_hand' in rotations:
+            left_hand_landmarks = landmarks_3d['left_hand']
+            left_hand_rotations = rotations['left_hand']
+
+            for landmark_idx, bone_name in self.VMC_BONE_MAPPING['left_hand'].items():
+                if landmark_idx < len(left_hand_landmarks):
+                    position = left_hand_landmarks[landmark_idx]
+
+                    if landmark_idx in left_hand_rotations:
+                        rotation_matrix = left_hand_rotations[landmark_idx].rotation_matrix
+                    else:
+                        rotation_matrix = np.eye(3)
+
+                    self.send_bone_transform(bone_name, position, rotation_matrix)
+
+        # Process right hand landmarks
+        if 'right_hand' in landmarks_3d and 'right_hand' in rotations:
+            right_hand_landmarks = landmarks_3d['right_hand']
+            right_hand_rotations = rotations['right_hand']
+
+            for landmark_idx, bone_name in self.VMC_BONE_MAPPING['right_hand'].items():
+                if landmark_idx < len(right_hand_landmarks):
+                    position = right_hand_landmarks[landmark_idx]
+
+                    if landmark_idx in right_hand_rotations:
+                        rotation_matrix = right_hand_rotations[landmark_idx].rotation_matrix
+                    else:
+                        rotation_matrix = np.eye(3)
+
+                    self.send_bone_transform(bone_name, position, rotation_matrix)
+
+        # Send frame available signal
+        self.send_frame_available()
+
+    def send_blendshape(self, name: str, value: float):
+        """
+        Send blendshape/morph value (for facial expressions)
+
+        Args:
+            name: Blendshape name
+            value: Blendshape value (0.0 to 1.0)
+        """
+        self.client.send_message("/VMC/Ext/Blend/Val", [name, float(value)])
+
+    def send_blend_apply(self):
+        """Signal that all blendshapes have been sent"""
+        self.client.send_message("/VMC/Ext/Blend/Apply", [])
+
+class EnhancedOSCVMCClient:
+    """
+    Enhanced OSC/VMC client that includes virtual joints (VT1, SACROILIAC)
+    Compatible with standard VMC protocol while adding spine representation
+    """
+
+    # Virtual joint indices
+    VIRTUAL_VT1 = -1
+    VIRTUAL_SACROILIAC = -2
+
+    # Enhanced VMC bone mapping using HAnim Joint Names including virtual joints
+    VMC_BONE_MAPPING = {
+        'pose': {
+            # Virtual joints (HAnim Standard)
+            -1: 'vt1',             # was Spine
+            -2: 'sacroiliac',      # was Hips
+
+            # Standard pose bones (HAnim Standard)
+            0: 'skullbase',        # was Head
+            11: 'l_shoulder',      # was LeftShoulder
+            12: 'r_shoulder',      # was RightShoulder
+            13: 'l_elbow',         # was LeftUpperArm
+            14: 'r_elbow',         # was RightUpperArm
+            15: 'l_wrist',         # was LeftLowerArm
+            16: 'r_wrist',         # was RightLowerArm
+            23: 'l_hip',           # was LeftUpperLeg
+            24: 'r_hip',           # was RightUpperLeg
+            25: 'l_knee',          # was LeftLowerLeg
+            26: 'r_knee',          # was RightLowerLeg
+            27: 'l_talocrural',    # was LeftFoot
+            28: 'r_talocrural',    # was RightFoot
+        },
+        'left_hand': {
+            0: 'l_radiocarpal',
+            1: 'l_carpometacarpal_1',
+            2: 'l_metacarpophalangeal_1',
+            3: 'l_carpal_interphalangeal_1',
+            5: 'l_metacarpophalangeal_2',
+            6: 'l_carpal_proximal_interphalangeal_2',
+            7: 'l_carpal_distal_interphalangeal_2',
+            9: 'l_metacarpophalangeal_3',
+            10: 'l_carpal_proximal_interphalangeal_3',
+            11: 'l_carpal_distal_interphalangeal_3',
+            13: 'l_metacarpophalangeal_4',
+            14: 'l_carpal_proximal_interphalangeal_4',
+            15: 'l_carpal_distal_interphalangeal_4',
+            17: 'l_metacarpophalangeal_5',
+            18: 'l_carpal_proximal_interphalangeal_5',
+            19: 'l_carpal_distal_interphalangeal_5',
+        },
+        'right_hand': {
+            0: 'r_radiocarpal',
+            1: 'r_carpometacarpal_1',
+            2: 'r_metacarpophalangeal_1',
+            3: 'r_carpal_interphalangeal_1',
+            5: 'r_metacarpophalangeal_2',
+            6: 'r_carpal_proximal_interphalangeal_2',
+            7: 'r_carpal_distal_interphalangeal_2',
+            9: 'r_metacarpophalangeal_3',
+            10: 'r_carpal_proximal_interphalangeal_3',
+            11: 'r_carpal_distal_interphalangeal_3',
+            13: 'r_metacarpophalangeal_4',
+            14: 'r_carpal_proximal_interphalangeal_4',
+            15: 'r_carpal_distal_interphalangeal_4',
+            17: 'r_metacarpophalangeal_5',
+            18: 'r_carpal_proximal_interphalangeal_5',
+            19: 'r_carpal_distal_interphalangeal_5',
+        }
+    }
+
+    def __init__(self, ip: str = "127.0.0.1", port: int = 39539,
+                 include_virtual_joints: bool = True):
+        """
+        Initialize Enhanced OSC/VMC client
+
+        Args:
+            ip: Target IP address
+            port: Target port (default: 39539 - VMC standard)
+            include_virtual_joints: If True, send VT1 and SACROILIAC (default: True)
+        """
+        self.ip = ip
+        self.port = port
+        self.client = udp_client.SimpleUDPClient(ip, port)
+        self.frame_count = 0
+        self.start_time = time.time()
+        self.include_virtual_joints = include_virtual_joints
+
+        print(f"Enhanced OSC/VMC Client initialized: {ip}:{port}")
+        print("VMC Protocol Address Patterns:")
+        print("  /VMC/Ext/Bone/Pos - Bone position and rotation")
+        print("  /VMC/Ext/Root/Pos - Root position and rotation")
+        print("  /VMC/Ext/OK - Frame available signal")
+        print("  /VMC/Ext/T - Time signal")
+        if include_virtual_joints:
+            print("\n✨ ENHANCED: Virtual joints enabled (HAnim)!")
+            print("  vt1 (Spine) - Upper spine reference")
+            print("  sacroiliac (Hips) - Pelvic reference")
+
+    def quaternion_from_rotation_matrix(self, R: np.ndarray) -> np.ndarray:
+        """
+        Convert rotation matrix to quaternion (x, y, z, w)
+        """
+        if R.shape != (3, 3):
+            return np.array([0.0, 0.0, 0.0, 1.0])
+
+        trace = np.trace(R)
+
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2, 1] - R[1, 2]) * s
+            y = (R[0, 2] - R[2, 0]) * s
+            z = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+
+        return np.array([x, y, z, w])
+
+    def send_bone_transform(self, bone_name: str, position: np.ndarray,
+                           rotation_matrix: np.ndarray = None,
+                           quaternion: np.ndarray = None):
+        """
+        Send bone position and rotation via VMC protocol
+        NOTE: Performs coordinate conversion from MediaPipe (Y-Down) to HAnim (Y-Up)
+        """
+        # Get quaternion from either source
+        if quaternion is not None:
+            quat = quaternion.copy()
+        elif rotation_matrix is not None:
+            quat = self.quaternion_from_rotation_matrix(rotation_matrix)
+        else:
+            quat = np.array([0.0, 0.0, 0.0, 1.0])
+
+        # --- COORDINATE SYSTEM FIX ---
+        # MediaPipe is Y-Down, HAnim is Y-Up.
+        # To convert, we must invert the Y position.
+        # For Quaternion, we invert Y and Z components to flip the axis system.
+
+        # 1. Position Y Flip
+        pos_x = float(position[0])
+        pos_y = -float(position[1]) # FLIP Y
+        pos_z = float(position[2])
+
+        # 2. Quaternion Axis Flip (x, -y, -z, w)
+        qx = float(quat[0])
+        qy = -float(quat[1])        # FLIP Y
+        qz = -float(quat[2])        # FLIP Z
+        qw = float(quat[3])
+
+        address = "/VMC/Ext/Bone/Pos"
+
+        self.client.send_message(address, [
+            bone_name,
+            pos_x, pos_y, pos_z,
+            qx, qy, qz, qw
+        ])
+
+    def send_root_transform(self, position: np.ndarray,
+                           rotation_matrix: np.ndarray = None,
+                           quaternion: np.ndarray = None):
+        """
+        Send root position and rotation via VMC protocol
+        NOTE: Performs coordinate conversion from MediaPipe (Y-Down) to HAnim (Y-Up)
+        """
+        if quaternion is not None:
+            quat = quaternion.copy()
+        elif rotation_matrix is not None:
+            quat = self.quaternion_from_rotation_matrix(rotation_matrix)
+        else:
+            quat = np.array([0.0, 0.0, 0.0, 1.0])
+
+        # --- COORDINATE SYSTEM FIX ---
+        # 1. Position Y Flip (Crucial for Root to put head above feet)
+        pos_x = float(position[0])
+        pos_y = -float(position[1]) # FLIP Y
+        pos_z = float(position[2])
+
+        # 2. Quaternion Axis Flip (x, -y, -z, w)
+        qx = float(quat[0])
+        qy = -float(quat[1])        # FLIP Y
+        qz = -float(quat[2])        # FLIP Z
+        qw = float(quat[3])
+
+        address = "/VMC/Ext/Root/Pos"
+
+        self.client.send_message(address, [
+            "root",
+            pos_x, pos_y, pos_z,
+            qx, qy, qz, qw,
+            0.0, 0.0, 0.0, 0.0
+        ])
+
+    def send_time(self):
+        """Send time signal (frame timing)"""
+        current_time = time.time() - self.start_time
+        self.client.send_message("/VMC/Ext/T", [float(current_time)])
+
+    def send_frame_available(self):
+        """Send frame available signal"""
+        self.client.send_message("/VMC/Ext/OK", [1])
+        self.frame_count += 1
+
+    def calculate_virtual_joint_positions(self, landmarks_3d: np.ndarray) -> Dict[int, np.ndarray]:
+        """Calculate virtual joint positions from real landmarks"""
+        virtual_positions = {}
+
+        if landmarks_3d is None or len(landmarks_3d) < 33:
+            return virtual_positions
+
+        try:
+            # VT1: Midpoint between shoulders
+            left_shoulder = landmarks_3d[11]
+            right_shoulder = landmarks_3d[12]
+            vt1 = (left_shoulder + right_shoulder) / 2.0
+            virtual_positions[self.VIRTUAL_VT1] = vt1
+
+            # SACROILIAC: Midpoint between hips
+            left_hip = landmarks_3d[23]
+            right_hip = landmarks_3d[24]
+            sacroiliac = (left_hip + right_hip) / 2.0
+            virtual_positions[self.VIRTUAL_SACROILIAC] = sacroiliac
+
+        except (IndexError, KeyError):
+            pass
+
+        return virtual_positions
+
+    def send_all_bones(self, landmarks_3d: dict, rotations: dict):
+        """Send all bone transforms including virtual joints"""
+        self.send_time()
+
+        if 'pose' in landmarks_3d and 'pose' in rotations:
+            pose_landmarks = landmarks_3d['pose']
+            pose_rotations = rotations['pose']
+
+            if self.include_virtual_joints:
+                virtual_positions = self.calculate_virtual_joint_positions(pose_landmarks)
+            else:
+                virtual_positions = {}
+
+            for landmark_idx, bone_name in self.VMC_BONE_MAPPING['pose'].items():
+                position = None
+                rotation_matrix = None
+                quaternion = None
+
+                # Handle virtual joints
+                if landmark_idx < 0:
+                    if not self.include_virtual_joints:
+                        continue
+
+                    if landmark_idx in virtual_positions:
+                        position = virtual_positions[landmark_idx]
+                        if landmark_idx in pose_rotations:
+                            rotation = pose_rotations[landmark_idx]
+                            rotation_matrix = rotation.rotation_matrix
+                            if hasattr(rotation, 'quaternion'):
+                                quaternion = rotation.quaternion
+                        else:
+                            rotation_matrix = np.eye(3)
+
+                # Handle real landmarks
+                else:
+                    if landmark_idx < len(pose_landmarks):
+                        position = pose_landmarks[landmark_idx]
+
+                        if landmark_idx in pose_rotations:
+                            rotation = pose_rotations[landmark_idx]
+                            rotation_matrix = rotation.rotation_matrix
+                            if hasattr(rotation, 'quaternion'):
+                                quaternion = rotation.quaternion
+                        else:
+                            rotation_matrix = np.eye(3)
+
+                if position is not None:
+                    self.send_bone_transform(bone_name, position,
+                                           rotation_matrix, quaternion)
+
+            # Send root transform
+            if self.include_virtual_joints and self.VIRTUAL_SACROILIAC in virtual_positions:
+                root_position = virtual_positions[self.VIRTUAL_SACROILIAC]
+                if self.VIRTUAL_SACROILIAC in pose_rotations:
+                    rotation = pose_rotations[self.VIRTUAL_SACROILIAC]
+                    if hasattr(rotation, 'quaternion'):
+                        self.send_root_transform(root_position,
+                                                quaternion=rotation.quaternion)
+                    else:
+                        self.send_root_transform(root_position,
+                                                rotation_matrix=rotation.rotation_matrix)
+                else:
+                    self.send_root_transform(root_position)
+            elif len(pose_landmarks) > 24:
+                hip_center = (pose_landmarks[23] + pose_landmarks[24]) / 2
+                self.send_root_transform(hip_center)
+
+        # Process hands
+        for hand_key in ['left_hand', 'right_hand']:
+            if hand_key in landmarks_3d and hand_key in rotations:
+                hand_landmarks = landmarks_3d[hand_key]
+                hand_rotations = rotations[hand_key]
+
+                for landmark_idx, bone_name in self.VMC_BONE_MAPPING[hand_key].items():
+                    if landmark_idx < len(hand_landmarks):
+                        position = hand_landmarks[landmark_idx]
+
+                        if landmark_idx in hand_rotations:
+                            rotation = hand_rotations[landmark_idx]
+                            if hasattr(rotation, 'quaternion'):
+                                self.send_bone_transform(bone_name, position,
+                                                       quaternion=rotation.quaternion)
+                            else:
+                                self.send_bone_transform(bone_name, position,
+                                                       rotation_matrix=rotation.rotation_matrix)
+                        else:
+                            self.send_bone_transform(bone_name, position)
+
+        self.send_frame_available()
+
+class OSCVMCStreamAnalyzer(AdvancedJointAnalyzer):
+    """
+    Extended analyzer with OSC/VMC streaming capabilities
+    """
+
+    def __init__(self, osc_ip: str = "127.0.0.1", osc_port: int = 39539):
+        """
+        Initialize with OSC/VMC client
+
+        Args:
+            osc_ip: OSC server IP address
+            osc_port: OSC server port
+        """
+        super().__init__()
+        self.osc_client = EnhancedOSCVMCClient(osc_ip, osc_port, include_virtual_joints=True)
+        self.send_osc = True
+
+    def process_and_stream(self, frame: np.ndarray) -> tuple:
+        """
+        Process frame and stream via OSC/VMC
+
+        Args:
+            frame: Input video frame
+
+        Returns:
+            Tuple of (annotated_frame, rotations, landmarks_3d)
+        """
+        # Process frame with MediaPipe
+        annotated_frame, rotations = self.process_frame(frame)
+
+        # Apply smoothing
+        smoothed_rotations = self.smooth_rotations(rotations, alpha=0.3)
+
+        # Store in history
+        self.rotation_history.append(smoothed_rotations)
+        if len(self.rotation_history) > self.max_history:
+            self.rotation_history.pop(0)
+
+        # Extract 3D landmarks for OSC transmission
+        landmarks_3d = {}
+
+        # Get MediaPipe results
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
+        results = self.holistic.process(image_rgb)
+
+        # Extract landmarks
+        if results.pose_landmarks:
+            landmarks_3d['pose'] = self.extract_3d_landmarks(results.pose_landmarks)
+
+        if results.left_hand_landmarks:
+            landmarks_3d['left_hand'] = self.extract_3d_landmarks(results.left_hand_landmarks)
+
+        if results.right_hand_landmarks:
+            landmarks_3d['right_hand'] = self.extract_3d_landmarks(results.right_hand_landmarks)
+
+        # Send via OSC/VMC if enabled
+        if self.send_osc and landmarks_3d:
+            self.osc_client.send_all_bones(landmarks_3d, smoothed_rotations)
+
+        return annotated_frame, smoothed_rotations, landmarks_3d
+
+
+def example_1_basic_tracking():
+    """Example 1: Basic rotation tracking"""
+    print("Example 1: Basic Rotation Tracking")
+    print("-" * 50)
+
+    analyzer = MediaPipeJointRotations()
+    cap = cv2.VideoCapture(0)
+
+    print("Tracking joint rotations... Press 'q' to quit")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        annotated_frame, rotations = analyzer.process_frame(frame)
+
+        # Print rotation info for left elbow
+        if 13 in rotations['pose']:  # Left elbow
+            elbow_rot = rotations['pose'][13]
+            print(f"Left Elbow - Roll: {elbow_rot.euler_angles[0]:.1f}°, "
+                  f"Pitch: {elbow_rot.euler_angles[1]:.1f}°, "
+                  f"Yaw: {elbow_rot.euler_angles[2]:.1f}°")
+
+        cv2.imshow('Example 1: Basic Tracking', annotated_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def example_2_angular_velocity():
+    """Example 2: Calculate angular velocity"""
+    print("\nExample 2: Angular Velocity Tracking")
+    print("-" * 50)
+
+    analyzer = AdvancedJointAnalyzer()
+    cap = cv2.VideoCapture(0)
+
+    previous_rotations = None
+    previous_time = cv2.getTickCount()
+
+    print("Tracking angular velocities... Press 'q' to quit")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        current_time = cv2.getTickCount()
+        dt = (current_time - previous_time) / cv2.getTickFrequency()
+
+        annotated_frame, current_rotations = analyzer.process_frame(frame)
+
+        # Calculate angular velocity
+        if previous_rotations is not None:
+            ang_vels = analyzer.analyze_angular_velocity(
+                current_rotations['pose'],
+                previous_rotations['pose'],
+                dt
+            )
+
+            # Display angular velocities
+            y_pos = 300
+            cv2.putText(annotated_frame, "Angular Velocities:",
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            y_pos += 25
+
+            for joint_idx, vel in list(ang_vels.items())[:3]:
+                text = f"Joint {joint_idx}: {vel:.2f} rad/s"
+                cv2.putText(annotated_frame, text, (10, y_pos),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                y_pos += 20
+
+        previous_rotations = current_rotations
+        previous_time = current_time
+
+        cv2.imshow('Example 2: Angular Velocity', annotated_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def example_3_pose_change_detection():
+    """Example 3: Detect significant pose changes"""
+    print("\nExample 3: Pose Change Detection")
+    print("-" * 50)
+
+    analyzer = AdvancedJointAnalyzer()
+    cap = cv2.VideoCapture(0)
+
+    print("Detecting pose changes... Press 'q' to quit")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        annotated_frame, rotations = analyzer.process_frame(frame)
+
+        # Store in history
+        analyzer.rotation_history.append(rotations)
+        if len(analyzer.rotation_history) > analyzer.max_history:
+            analyzer.rotation_history.pop(0)
+
+        # Detect changes
+        changed_joints = analyzer.detect_pose_changes(rotations, threshold=15.0)
+
+        # Display changed joints
+        if changed_joints:
+            y_pos = 300
+            cv2.putText(annotated_frame, "Pose Changes Detected:",
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            y_pos += 25
+
+            for change in changed_joints[:3]:
+                text = f"{change['name']}: {change['angle_change']:.1f}°"
+                cv2.putText(annotated_frame, text, (10, y_pos),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+                y_pos += 20
+
+        cv2.imshow('Example 3: Pose Change Detection', annotated_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def example_4_smoothed_rotations():
+    """Example 4: Apply smoothing to rotation data"""
+    print("\nExample 4: Smoothed Rotations")
+    print("-" * 50)
+
+    analyzer = AdvancedJointAnalyzer()
+    cap = cv2.VideoCapture(0)
+
+    print("Showing smoothed rotations... Press 'q' to quit")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        annotated_frame, rotations = analyzer.process_frame(frame)
+
+        # Apply smoothing
+        smoothed_rotations = analyzer.smooth_rotations(rotations, alpha=0.3)
+
+        # Store in history
+        analyzer.rotation_history.append(smoothed_rotations)
+        if len(analyzer.rotation_history) > analyzer.max_history:
+            analyzer.rotation_history.pop(0)
+
+        # Display smoothing info
+        cv2.putText(annotated_frame, "Smoothing: alpha=0.3",
+                   (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+
+        cv2.imshow('Example 4: Smoothed Rotations', annotated_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def example_5_export_data():
+    """Example 5: Export rotation data"""
+    print("\nExample 5: Export Rotation Data")
+    print("-" * 50)
+
+    analyzer = AdvancedJointAnalyzer()
+    cap = cv2.VideoCapture(0)
+
+    frame_count = 0
+    print("Recording... Press 's' to save, 'q' to quit")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        annotated_frame, rotations = analyzer.process_frame(frame)
+        frame_count += 1
+
+        cv2.putText(annotated_frame, f"Frame: {frame_count}",
+                   (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, "Press 's' to save JSON",
+                   (10, 325), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.imshow('Example 5: Export Data', annotated_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('s'):
+            filename = f"rotations_frame_{frame_count}.json"
+            analyzer.export_to_json(rotations, filename)
+            print(f"Saved: {filename}")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def example_6_osc_vmc_streaming():
+    """Example 6: Stream via OSC/VMC protocol"""
+    print("\nExample 6: OSC/VMC Protocol Streaming")
+    print("-" * 50)
+
+    # Configuration
+    print("\nOSC/VMC Server Configuration:")
+    print("Default: localhost:39539 (VMC Protocol standard)")
+
+    use_default = input("Use default settings? (y/n): ").strip().lower()
+
+    if use_default == 'y':
+        osc_ip = "127.0.0.1"
+        osc_port = 39539
+    else:
+        osc_ip = input("Enter OSC server IP (default: 127.0.0.1): ").strip() or "127.0.0.1"
+        osc_port = int(input("Enter OSC server port (default: 39539): ").strip() or "39539")
+
+    print(f"\nConnecting to OSC/VMC server at {osc_ip}:{osc_port}")
+    print("\nVMC Protocol Information:")
+    print("  - Compatible with VSeeFace, VMC Protocol apps")
+    print("  - Sends bone positions and rotations as quaternions")
+    print("  - Updates at video frame rate")
+    print("\nPress 'q' to quit, 'p' to pause/resume OSC streaming")
+    print("-" * 50)
+
+    # Create analyzer with OSC streaming
+    analyzer = OSCVMCStreamAnalyzer(osc_ip, osc_port)
+    cap = cv2.VideoCapture(0)
+
+    frame_count = 0
+    fps_start_time = time.time()
+    fps = 0
+    osc_message_count = 0
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        # Process and stream
+        annotated_frame, rotations, landmarks_3d = analyzer.process_and_stream(frame)
+
+        # Calculate FPS
+        frame_count += 1
+        if frame_count % 30 == 0:
+            fps = 30 / (time.time() - fps_start_time)
+            fps_start_time = time.time()
+
+        # Count OSC messages
+        if analyzer.send_osc:
+            osc_message_count = analyzer.osc_client.frame_count
+
+        # Display OSC status
+        y_pos = 30
+        cv2.putText(annotated_frame, f"FPS: {fps:.1f}",
+                   (annotated_frame.shape[1] - 120, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        y_pos = annotated_frame.shape[0] - 100
+        status_color = (0, 255, 0) if analyzer.send_osc else (0, 0, 255)
+        status_text = "STREAMING" if analyzer.send_osc else "PAUSED"
+
+        cv2.putText(annotated_frame, f"OSC/VMC: {status_text}",
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        y_pos += 25
+
+        cv2.putText(annotated_frame, f"Server: {osc_ip}:{osc_port}",
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_pos += 20
+
+        cv2.putText(annotated_frame, f"Frames sent: {osc_message_count}",
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_pos += 20
+
+        # Count bones being sent
+        bone_count = 0
+        if 'pose' in landmarks_3d:
+            bone_count += len([k for k in analyzer.osc_client.VMC_BONE_MAPPING['pose'].keys()
+                              if k < len(landmarks_3d['pose'])])
+        if 'left_hand' in landmarks_3d:
+            bone_count += len([k for k in analyzer.osc_client.VMC_BONE_MAPPING['left_hand'].keys()
+                              if k < len(landmarks_3d['left_hand'])])
+        if 'right_hand' in landmarks_3d:
+            bone_count += len([k for k in analyzer.osc_client.VMC_BONE_MAPPING['right_hand'].keys()
+                              if k < len(landmarks_3d['right_hand'])])
+
+        cv2.putText(annotated_frame, f"Active bones: {bone_count}",
+                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.imshow('Example 6: OSC/VMC Streaming', annotated_frame)
+
+        # Handle keyboard input
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('p'):
+            analyzer.send_osc = not analyzer.send_osc
+            status = "resumed" if analyzer.send_osc else "paused"
+            print(f"OSC streaming {status}")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print(f"\nTotal frames sent: {osc_message_count}")
+
+
+def main():
+    """Run all examples"""
+    examples = [
+        ("Basic Rotation Tracking", example_1_basic_tracking),
+        ("Angular Velocity Tracking", example_2_angular_velocity),
+        ("Pose Change Detection", example_3_pose_change_detection),
+        ("Smoothed Rotations", example_4_smoothed_rotations),
+        ("Export Rotation Data", example_5_export_data),
+        ("OSC/VMC Protocol Streaming", example_6_osc_vmc_streaming),
+    ]
+
+    print("\n" + "=" * 70)
+    print("Advanced Usage Examples - MediaPipe Joint Rotations")
+    print("=" * 70)
+    print("\nAvailable examples:")
+    for i, (name, _) in enumerate(examples, 1):
+        print(f"{i}. {name}")
+    print("0. Run all examples in sequence")
+    print("=" * 70)
+
+    choice = input("\nSelect example (0-6): ").strip()
+
+    try:
+        choice = int(choice)
+        if choice == 0:
+            for name, func in examples:
+                print(f"\n{'='*70}")
+                print(f"Running: {name}")
+                print('='*70)
+                func()
+        elif 1 <= choice <= len(examples):
+            examples[choice - 1][1]()
+        else:
+            print("Invalid choice!")
+    except ValueError:
+        print("Invalid input!")
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+
+
+if __name__ == "__main__":
+    main()
